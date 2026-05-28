@@ -35,22 +35,22 @@ class LPProblem:
 
 @dataclass
 class RPDHGParams:
-    tau: Optional[float] = None  # will be calculated in pdhg
-    sigma: Optional[float] = None
-    theta: float = 1.05          # acceleration per step
-    alpha:float = 1.0
-    rebalancing_threshhold:float = 1.5
-    step_shrinkage:float = 0.75
-    restart_check: str = "adaptive"
-    min_epoch_length: int = 500
-    max_iter: int = 100_000
-    fixed_iter_restart:int = 2000
-    tol_primal: float = 1e-2
-    tol_dual: float = 1e-2
-    tol_gap: float = 1e-2
-    tau_sigma_preconditioned: bool = True
-    rebalance_tau_sigma: bool = False
-    diagnostik_i: int = min_epoch_length            # residuals stored every diagnostik_i iter
+    tau: Optional[float] = None        # primal step size; None → computed by Pock-Chambolle preconditioner
+    sigma: Optional[float] = None      # dual step size; None → computed by Pock-Chambolle preconditioner
+    theta: float = 1.05                # multiplicative growth applied to tau/sigma each iteration; line search shrinks them back if too large
+    alpha: float = 1.0                 # Pock-Chambolle exponent: tau_base = 2^-α, sigma_base = N^-(2-α); shifts weight between primal/dual step sizes
+    rebalancing_threshhold: float = 1.5  # ratio threshold for optional tau/sigma rebalancing: rebalance if primal/dual residual ratio > T or < 1/T
+    step_shrinkage: float = 0.75       # factor applied to tau/sigma when the Malitsky-Pock line-search test fails
+    restart_check: str = "adaptive"    # restart strategy: "adaptive" (Applegate et al. μ-metric), "fixed" (every fixed_iter_restart iters), "none"
+    min_epoch_length: int = 500        # adaptive restarts only fire after this many iterations since the last restart
+    max_iter: int = 100_000            # hard iteration cap; solver returns with status "max_iter_reached" if hit
+    fixed_iter_restart: int = 2000     # "fixed" mode: restart period; "adaptive" mode: hard cap per epoch regardless of μ
+    tol_primal: float = 1e-2           # convergence threshold for relative primal residual ‖Ax-b‖/(1+‖b‖)
+    tol_dual: float = 1e-2             # convergence threshold for relative dual residual ‖(A^T y-c)_+‖/(1+‖c‖)
+    tol_gap: float = 1e-2              # convergence threshold for relative duality gap |c^T x - b^T y|/(1+|obj|)
+    tau_sigma_preconditioned: bool = True   # if True use Pock-Chambolle preconditioner; if False fall back to τ=σ=1/√2 (spectral-norm only)
+    rebalance_tau_sigma: bool = False  # enable step-size rebalancing when primal/dual residuals become strongly imbalanced
+    diagnostik_i: int = min_epoch_length    # evaluate residuals/gap and run restart logic every this many iterations
 
 
 @dataclass
