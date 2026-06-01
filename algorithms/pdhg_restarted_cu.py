@@ -45,10 +45,11 @@ def pdhg_restarted_cu(
         if params.tau_sigma_preconditioned:
 
             tau, sigma = compute_ot_preconditioner_cu(N = N,norm_b = norm_b, norm_c = norm_c, alpha=params.alpha)
+            tau, sigma = float(tau), float(sigma)
 
         else:
-            # ||A||² = 2
-            tau, sigma = 1.0 / cp.sqrt(2.0)
+            # ||A||² = 2N, normalised per-element -> 1/sqrt(2)
+            tau = sigma = float(1.0 / cp.sqrt(2.0))
 
         if params.theta is not None:
             tau *= params.theta
@@ -61,6 +62,10 @@ def pdhg_restarted_cu(
 
     grad_buffer = cp.empty(n)
     x_tilde_buf = cp.empty((N, N))
+    dx_buf = cp.empty(n)
+    dy_buf = cp.empty(m)
+    row_sum_dx_buf = cp.empty(N)
+    col_sum_dx_buf = cp.empty(N)
 
     # Initializing the pointers
     x_curr, y_curr = x_0, y_0
@@ -99,17 +104,17 @@ def pdhg_restarted_cu(
 
             #--- calc step acceptance criteria---
 
-            dx = x_next - x_curr
-            dy = y_next - y_curr
+            cp.subtract(x_next, x_curr, out=dx_buf)
+            cp.subtract(y_next, y_curr, out=dy_buf)
 
-            dx_mat = dx.reshape(N, N)
-            row_sum_dx = dx_mat.sum(axis=1)
-            col_sum_dx = dx_mat.sum(axis=0)
+            dx_mat = dx_buf.reshape(N, N)
+            dx_mat.sum(axis=1, out=row_sum_dx_buf)
+            dx_mat.sum(axis=0, out=col_sum_dx_buf)
 
             # interaction = <dy, A*dx>
-            interaction = cp.dot(dy[:N], row_sum_dx) + cp.dot(dy[N:], col_sum_dx)
+            interaction = cp.dot(dy_buf[:N], row_sum_dx_buf) + cp.dot(dy_buf[N:], col_sum_dx_buf)
 
-            norm_sq = (1.0 / tau * cp.sum(dx ** 2)) + (1.0 / sigma * cp.sum(dy ** 2))
+            norm_sq = (1.0 / tau) * cp.dot(dx_buf, dx_buf) + (1.0 / sigma) * cp.dot(dy_buf, dy_buf)
 
             if 2.0 * cp.abs(interaction) <= 0.95 * norm_sq:
                 success = True
@@ -123,6 +128,7 @@ def pdhg_restarted_cu(
         if not success:
 
             tau, sigma = compute_ot_preconditioner_cu(N=N, norm_b=norm_b, norm_c=norm_c, alpha=params.alpha)
+            tau, sigma = float(tau), float(sigma)
 
             # use safe step size
             one_pdhg_step_gpu_inplace(
