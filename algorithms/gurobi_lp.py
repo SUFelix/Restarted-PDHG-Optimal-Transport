@@ -61,7 +61,18 @@ def solve_lp_gurobi(
 
     model.optimize()
 
-    status = model.Status
+    grb_status = model.Status
+
+    _STATUS_MAP = {
+        GRB.OPTIMAL:         "completed",
+        GRB.TIME_LIMIT:      "time_limit_reached",
+        GRB.ITERATION_LIMIT: "max_iter_reached",
+        GRB.INFEASIBLE:      "infeasible",
+        GRB.UNBOUNDED:       "unbounded",
+        GRB.INF_OR_UNBD:     "inf_or_unbounded",
+        GRB.SUBOPTIMAL:      "suboptimal",
+    }
+    status = _STATUS_MAP.get(grb_status, f"gurobi_status_{grb_status}")
 
     info = {
         "status": status,
@@ -73,7 +84,7 @@ def solve_lp_gurobi(
     x_opt = np.zeros(n)
     y_opt = np.zeros(m)
 
-    if status == GRB.OPTIMAL:
+    if grb_status == GRB.OPTIMAL:
         x_opt = x.X
 
         try:
@@ -88,8 +99,8 @@ def solve_lp_gurobi(
     return SolverResult(
         x=x_opt,
         y=y_opt,
-        status=str(status),
-        primal_obj_seq=[model.ObjVal],
+        status=status,
+        primal_obj_seq=[model.ObjVal] if grb_status == GRB.OPTIMAL else None,
         gaps=None
     )
 
