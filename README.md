@@ -263,7 +263,7 @@ We also varied the `min_epoch_length` parameter, which sets the minimum number o
 iterations an epoch must run before an adaptive restart may be triggered.
 
 <p align="center">
-  <img src="diagrams/transportation_runtime_results_different_min_epoch_length.pdf" alt="Runtime for different min_epoch_length values" width="1000">
+  <img src="diagrams/min_epoch_length_comparison.png" alt="Runtime for different min_epoch_length values" width="1000">
 </p>
 
 Across the tested values the runtimes are essentially indistinguishable, so the
