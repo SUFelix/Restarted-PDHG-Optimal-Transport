@@ -81,14 +81,7 @@ By normalizing the KKT residuals by the distance $dist(z, z_{ref})$, we obtain a
 ## Diagonal Preconditioning 
 
 
-# Results(inkl diagrams)
 
-To find a good tradeoff between reducing diagnostic overhead and ... different intervals were tested (for adaptive restarts)
-<p align="center">
-  <img src="diagrams/transportation_runtime_results2.png" alt="Duality Gap" width="1000">
-</p>
-
-/*TODO: , Vergleich Laufzeit Gurobi/RPDHG*/
 
 ## Duality Gap 
 
@@ -257,3 +250,40 @@ The hot loop performs **zero heap allocations**:
 
 This is what allows the GPU kernels to dominate the runtime profile and the solver
 to scale to the $1024 \times 1024$ transport problems of the DOTmark benchmark.
+
+# Results
+
+> **Hardware.** All results below were produced on a machine with an AMD Ryzen
+> 6-core CPU (3.59 GHz), 16 GB RAM, and an NVIDIA GeForce GTX 1050 Ti GPU
+> (4 GB VRAM, driver 560.94) running Windows 10. Software: Python 3.14, NumPy
+> 2.4, SciPy 1.16, and Gurobi 13.0.
+
+
+We also varied the `min_epoch_length` parameter, which sets the minimum number of
+iterations an epoch must run before an adaptive restart may be triggered.
+
+<p align="center">
+  <img src="diagrams/transportation_runtime_results_different_min_epoch_length.pdf" alt="Runtime for different min_epoch_length values" width="1000">
+</p>
+
+Across the tested values the runtimes are essentially indistinguishable, so the
+choice of `min_epoch_length` does not appear to make much of a difference for the
+overall solver performance.
+
+We also compared different values of the step-size rebalancing threshold
+`rebalancing_threshhold`, which controls when the primal/dual step sizes are
+rebalanced.
+
+<p align="center">
+  <img src="diagrams/rebalancing_thresholds_comparison.png" alt="Runtime for different rebalancing thresholds" width="1000">
+</p>
+
+As with `min_epoch_length`, the exact rebalancing threshold does not seem to
+matter much — the runtimes are very similar across the tested values.
+
+We also compared the runtime of our rPDHG solver against Gurobi. Gurobi
+significantly outperformed rPDHG on the tested problems.
+
+<p align="center">
+  <img src="diagrams/comparison_with_gurobi.png" alt="Runtime comparison rPDHG vs. Gurobi" width="1000">
+</p>
