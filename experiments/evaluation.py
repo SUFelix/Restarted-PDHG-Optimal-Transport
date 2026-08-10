@@ -7,6 +7,52 @@ import scipy.sparse as sp
 from algorithms.models import LPProblem, SolverConfig, SolverResult, EvaluationResult, GurobiParams, RPDHGParams
 from experiments.utils_io import gather_environment_info, write_experiment_run
 
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
+
+
+def warmup_rpdhg_gpu(grid_size: int = 4, max_iter: int = 60) -> None:
+    """
+    Run pdhg_restarted_cu once on a tiny synthetic OT problem so that CUDA
+    context init and CuPy kernel JIT compilation happen here, not inside the
+    first timed evaluate_solver() call. Call this once per process before
+    any timed rPDHG runs. No-op if CuPy/GPU is unavailable.
+    """
+    if cp is None:
+        return
+
+    from algorithms.pdhg_restarted_cu import pdhg_restarted_cu
+    from transportation_problems.dotmark.build_ot_problem import (
+        pixel_coordinates, build_cost_vector, build_constraint_matrix,
+    )
+
+    n = grid_size * grid_size
+    rng = np.random.default_rng(0)
+    a = rng.random(n) + 1e-3
+    a /= a.sum()
+    d = rng.random(n) + 1e-3
+    d /= d.sum()
+
+    c_raw = build_cost_vector(pixel_coordinates(grid_size, grid_size))
+    c_max = float(c_raw.max()) if c_raw.max() > 0.0 else 1.0
+    c = c_raw / c_max
+    A = build_constraint_matrix(n)
+    b = np.concatenate([a, d]) * n
+
+    dummy_problem = LPProblem(
+        A=A, b=b, c=c, name="__gpu_warmup__", A_shape=tuple(A.shape),
+        height=grid_size, width=grid_size, sum_A=float(a.sum()), sum_b=float(d.sum()),
+        cost_type="squared_euclidean", c_max=c_max, dotmark_type="warmup",
+    )
+
+    # diagnostik_i <= max_iter so the diagnostic/restart-check kernels (which
+    # only run every diagnostik_i iters in the real solver) also get JIT'd here.
+    warmup_params = RPDHGParams(max_iter=max_iter, diagnostik_i=max(1, max_iter // 3))
+    pdhg_restarted_cu(dummy_problem, warmup_params)
+    cp.cuda.Stream.null.synchronize()
+
 
 def compute_primal_residual(A, x: np.ndarray, b: np.ndarray) -> float:
     r = A.dot(x) - b if sp.issparse(A) else (A @ x - b)
@@ -14,8 +60,10 @@ def compute_primal_residual(A, x: np.ndarray, b: np.ndarray) -> float:
 
 
 def compute_dual_residual(A, y: np.ndarray, c: np.ndarray) -> float:
-    s = A.T.dot(y) + c if sp.issparse(A) else (A.T @ y + c)
-    return float(np.linalg.norm(np.minimum(0.0, s)))
+    # Dual feasibility for min c^T x s.t. Ax=b, x>=0 is A^T y <= c;
+    # violation is the positive part of (A^T y - c).
+    s = A.T.dot(y) - c if sp.issparse(A) else (A.T @ y - c)
+    return float(np.linalg.norm(np.maximum(0.0, s)))
 
 
 def _downsample(seq: Optional[list], max_points: int = 1000) -> Optional[list]:
@@ -40,8 +88,17 @@ def evaluate_solver(
     A, b, c = problem.A, problem.b, problem.c
     m, n = A.shape
 
+    # Drain any pending async GPU work from a previous call before starting the
+    # clock, and make sure the timed solver's own GPU work has actually
+    # finished before stopping it (CuPy kernel launches are async).
+    if cp is not None:
+        cp.cuda.Stream.null.synchronize()
+
     t0 = time.perf_counter()
     solver_result = solver_fn(problem)
+
+    if cp is not None:
+        cp.cuda.Stream.null.synchronize()
     runtime = time.perf_counter() - t0
 
     if not isinstance(solver_result, SolverResult):
@@ -59,7 +116,7 @@ def evaluate_solver(
 
     # --- Compute metrics ---
     primal_obj = float(c @ x)
-    dual_obj   = float(-b @ y)
+    dual_obj   = float(b @ y)
     norm_b     = float(np.linalg.norm(b))
     norm_c     = float(np.linalg.norm(c))
 
