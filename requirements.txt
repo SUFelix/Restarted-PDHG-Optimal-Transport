@@ -1,9 +1,23 @@
 numpy~=2.4.2
 scipy~=1.16.3
-numba~=0.64.0
 pandas~=2.3.3
 matplotlib~=3.10.6
 seaborn~=0.13.2
+psutil~=7.2.2  # CPU/RAM stats in experiments/utils_io.py::gather_environment_info
+
+# CuPy — the actual solver (algorithms/pdhg_restarted_cu.py, onestep.py) is
+# CUDA-only and imports cupy directly; nothing in algorithms/ runs on CPU.
+# The wheel name is CUDA-toolkit-specific (built/tested here against CUDA
+# 12.6, driver 560.94); swap for cupy-cuda11x/cupy-cuda13x/cupy to match your
+# local CUDA install if this one doesn't fit — see docs.cupy.dev/en/stable/install.html.
+cupy-cuda12x~=14.0.1
+
+# Notebook runtime — experiments are driven from notebooks/ and
+# dotmark_experiments.ipynb, not a CLI (see CLAUDE.md).
+ipykernel~=7.2.0  # dev only
+nbconvert~=7.17.1  # dev only, needed to run notebooks non-interactively
+
+pytest~=9.1  # dev/test only
 
 # Gurobi LP solver — requires a separate Gurobi license (free academic license available at gurobi.com).
 # The rest of the project runs without it; only algorithms/gurobi_lp.py needs it.

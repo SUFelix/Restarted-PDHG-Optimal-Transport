@@ -196,6 +196,12 @@ def evaluate_solver(
                 list(solver_result.gaps) if solver_result.gaps is not None else None
             ),
             "restart_indices": solver_result.restart_indices,
+            "tau": _downsample(
+                list(solver_result.tau_seq) if getattr(solver_result, 'tau_seq', None) is not None else None
+            ),
+            "sigma": _downsample(
+                list(solver_result.sigma_seq) if getattr(solver_result, 'sigma_seq', None) is not None else None
+            ),
         }
 
         if True: #(verbose)

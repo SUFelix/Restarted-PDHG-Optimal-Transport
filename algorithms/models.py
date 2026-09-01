@@ -16,6 +16,8 @@ class SolverResult:
     iterations:Optional[int] = None
     restarts:Optional[int] = None
     restart_indices: Optional[List[int]] = None
+    tau_seq: Optional[List[float]] = None
+    sigma_seq: Optional[List[float]] = None
 
 
 @dataclass

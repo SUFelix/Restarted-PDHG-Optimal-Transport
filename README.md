@@ -1,6 +1,64 @@
-# Overview
-This project implements a first Order solver for Optimal Transport problems, the restarted Primal-Dual Hybrid Gradient (rPDHG) algorithm. 
-It combines different restart heuristics with specialized Pock-Chambolle preconditioning, wich are compared on the DOTMARK-Benchmark Problems.
+# rPDHG — GPU-Accelerated Optimal Transport Solver
+
+A from-scratch GPU solver for discrete Optimal Transport (Kantorovich LP),
+benchmarked against the commercial solver Gurobi on 400 real-world problem
+instances.
+
+## Key Results
+
+- **Matches Gurobi's solution quality**: median relative objective
+  difference of $3.1\times10^{-9}$ across 400 benchmark instances — the two
+  solvers agree to 9 significant digits.
+- **Fully GPU-resident**: the entire solve — including a closed-form
+  spectral-norm derivation that replaces iterative approximation — runs on
+  the GPU via CuPy, without ever materializing the constraint matrix.
+- **Rigorously benchmarked**: 400 DOTmark instances across all 10 problem
+  categories, a systematic 3-phase hyperparameter search, and a dedicated
+  investigation into the GPU synchronization bottleneck limiting current
+  performance.
+- **Own implementation of a 2021 research algorithm** (adaptive restarts
+  from Applegate et al., NeurIPS 2021 — the method behind Google's PDLP
+  solver), specialized to the Optimal Transport constraint structure.
+
+<p align="center">
+  <img src="diagrams/rpdhg_vs_gurobi_runtime.png" alt="rPDHG vs. Gurobi runtime comparison" width="700">
+</p>
+
+<p align="center"><em>Runtime per problem instance, rPDHG vs. Gurobi (log-log, n=400).
+rPDHG currently trails Gurobi at this (comparatively small) problem size — see the
+sync-bottleneck write-up below for why, and where the gap is expected to close.</em></p>
+
+## Tech Stack
+
+Python · CuPy (CUDA) · NumPy/SciPy · Gurobi · pytest · Jupyter
+
+## What's Interesting About This, in Plain Terms
+
+Optimal Transport asks: what's the cheapest way to move one distribution of
+mass into another — e.g., turning one image's pixel intensities into
+another's? Written out exactly, this becomes a linear program with as many
+variables as there are pixel-pairs: for two $32\times32$ images that's
+already ~1 million variables, growing quadratically with resolution.
+Generic LP solvers choke on this quickly.
+
+This project builds a specialized first-order solver (PDHG, primal-dual
+hybrid gradient) that exploits the specific structure of the transport
+problem to run entirely on the GPU: no sparse matrix is ever built, every
+step is a handful of GPU array operations, and the algorithm's own
+convergence parameters are computed in closed form instead of estimated. It
+also implements an adaptive restart strategy from a 2021 NeurIPS paper (the
+algorithmic core behind Google's production LP solver PDLP) to keep the
+underlying method from oscillating.
+
+The project includes a full experimental pipeline — hyperparameter tuning, a
+400-instance benchmark against Gurobi, correctness verification, and a
+GPU-profiling investigation into a synchronization bottleneck — written up
+in an accompanying [scientific report](Abschlussbericht.pdf).
+
+For the full mathematical derivation, implementation details, and complete
+experimental results, see below.
+
+---
 
 # Mathematical Background
 
@@ -78,16 +136,17 @@ At each diagnostic interval, the solver compares the current iterate and the ave
 
 #### 3. Why this works
 By normalizing the KKT residuals by the distance $dist(z, z_{ref})$, we obtain a scale-invariant measure of "progress per unit of movement." This allows the solver to detect when the algorithm is merely oscillating around an optimum without making meaningful progress, triggering a momentum reset to refocus the search direction.
-## Diagonal Preconditioning 
-
-
-
-
 ## Duality Gap 
 
 <p align="center">
-  <img src="diagrams/transportation_gap3.png" alt="Duality Gap" width="1000">
+  <img src="diagrams/transportation_gap_convergence.png" alt="Duality Gap" width="1000">
 </p>
+
+Relative duality gap over wall-clock time, one panel per DOTmark class (all
+400 instances of the $32\times32$ benchmark described below, one curve per
+instance). Vertical ticks at the top mark restart events; the dashed line
+marks the relative tolerance $10^{-2}$.
+
 # Algorithm Implementation Details
 
 This section describes how the rPDHG solver is implemented in the two core files
@@ -240,16 +299,82 @@ convergence stays guaranteed as long as this product remains below 1.
 
 ### Memory and Allocation Discipline
 
-The hot loop performs **zero heap allocations**:
-- all per-step arithmetic in `onestep.py` uses `out=` parameters and in-place operators;
-- the ergodic average and the line-search differences are written into pre-allocated
-  buffers (`grad_buffer`, `x_tilde_buf`);
-- iterate advancement is a Python reference swap, never a copy;
-- only the restart action and the (infrequent) diagnostic block allocate small
-  temporaries — and the diagnostic block runs only every `diagnostik_i` iterations.
+The hot loop is allocation-*light*, not fully allocation-free — the line-search
+acceptance test is the only part that is completely allocation-free:
+- the differences $\Delta x, \Delta y$ and the row/column sums needed for the
+  acceptance test are written into pre-allocated buffers via `out=`;
+- iterate advancement is a Python reference swap, never a copy.
 
-This is what allows the GPU kernels to dominate the runtime profile and the solver
-to scale to the $1024 \times 1024$ transport problems of the DOTmark benchmark.
+Two other components still allocate, but at very different frequencies. The
+Welford update of the ergodic average
+(`cp.add(x_avg, x_next * ik, out=x_avg)`) allocates the intermediate
+`x_next * ik` fresh on *every* iteration, since it lacks an `out=` argument.
+The `one_pdhg_step_gpu_inplace` kernel itself (`onestep.py`) also allocates a
+handful of small temporary arrays of size $N$ per step for the supply/demand
+row and column sums. Restart bookkeeping (`.copy()` of the restart candidate
+and reference point) allocates only at diagnostic checkpoints or actual
+restarts — much less frequently. A fully allocation-free version of both the
+inner kernel and the Welford update is possible (one extra preallocated
+scratch buffer of size $N$ resp. $N^2$ each) but was not runtime-limiting for
+the problem sizes tested here. The expensive diagnostic block (full KKT
+residuals, gap evaluation, restart decision) allocates temporaries too, but
+runs only every `diagnostik_i` iterations.
+
+Despite these remaining allocations, GPU kernels dominate the runtime profile
+and the solver scales to the $1024 \times 1024$ transport problems of the
+DOTmark benchmark. The more significant runtime factor at the tested problem
+sizes turned out to be host-device synchronization, not allocation — see the
+next section.
+
+### Host-Device Synchronization Bottleneck
+
+Even though every array lives on the GPU and the inner kernel avoids heap
+allocations, the *control flow* of the outer loop is still data-dependent:
+both the line-search acceptance test and the restart/termination decisions
+are evaluated by a Python `if`. CuPy dispatches arithmetic on `cp.ndarray`
+objects asynchronously — operations are merely queued on the GPU stream — but
+as soon as a result is consumed by a Python `if`, `max()/min()`, or
+`float(...)` (as happens for the line-search test every iteration, and for
+every metric in the diagnostic block), CuPy must resolve it to a concrete
+Python bool/float. This forces a device-to-host transfer, i.e. a
+`cudaStreamSynchronize`: a hard barrier that drains the entire GPU kernel
+queue built up so far before Python can continue.
+
+Concretely, every outer iteration incurs at least one such sync (the
+line-search test, repeated once per rejected attempt up to 10 times), and a
+diagnostic iteration incurs roughly a dozen more (metric evaluation for both
+the current and the averaged iterate, plus the adaptive-restart comparisons).
+For the tested DOTmark sizes, a single elementwise or reduction kernel on the
+GTX 1050 Ti used for benchmarking takes only microseconds to tens of
+microseconds — comparable to or smaller than the `cudaStreamSynchronize` and
+CuPy dispatch overhead itself. This repeatedly drains and re-fills the GPU
+queue, producing a "spiky" utilization pattern with a low duty cycle rather
+than continuous load.
+
+This was checked empirically with a paired rerun of the `diagnostik_i` sweep
+(all 45 LogGRF pairs at $32\times32$, `diagnostik_i` $\in \{10, 25, 50\}$):
+isolating seconds-per-iteration from the confounding convergence-overshoot
+effect (a coarser diagnostic interval delays convergence detection) shows the
+expected effect cleanly — `diagnostik_i=10` costs more per iteration than
+`diagnostik_i=50` on **45 of 45 instances** (median reduction 12.5%, mean
+14.1%). A parallel `nvidia-smi` utilization trace, by contrast, showed no
+visible dip (a constant ~85–87% throughout), which turned out to be a
+resolution artifact of the tool (its polling window of ~25–30 Hz is orders of
+magnitude coarser than the postulated synchronization gaps), not evidence
+against the effect.
+
+<p align="center">
+  <img src="diagrams/sync_frequency_runtime.png" alt="Sync frequency vs. runtime" width="1000">
+</p>
+
+This bottleneck is structural, not a one-off implementation oversight: any
+restart-based first-order method that makes a data-dependent line-search or
+restart decision per iteration must resolve that decision on the host to
+drive Python control flow. Removing it would require moving the decision
+logic itself onto the device — e.g. a branch-free acceptance test via
+`cp.where`, capturing the fixed kernel sequence in a CUDA graph, or batching
+multiple independent DOTmark instances into one larger elementwise problem so
+the fixed per-iteration sync cost amortizes over more actual GPU work.
 
 # Results
 
@@ -281,9 +406,107 @@ rebalanced.
 As with `min_epoch_length`, the exact rebalancing threshold does not seem to
 matter much — the runtimes are very similar across the tested values.
 
-We also compared the runtime of our rPDHG solver against Gurobi. Gurobi
-significantly outperformed rPDHG on the tested problems.
+## Comparison with Gurobi
+
+We ran a direct comparison against Gurobi 13.0 on 400 DOTmark instances (all
+10 categories, 40 pairs each, $32\times32$), both solvers at relative
+tolerance $10^{-8}$. GPU warmup and explicit `cudaStreamSynchronize` calls
+around each timed rPDHG run keep CUDA context initialization and
+asynchronous kernel tails out of the measurement. All 400 rPDHG and all 400
+Gurobi runs reached `completed`.
 
 <p align="center">
-  <img src="diagrams/comparison_with_gurobi.png" alt="Runtime comparison rPDHG vs. Gurobi" width="1000">
+  <img src="diagrams/rpdhg_vs_gurobi_runtime.png" alt="Runtime comparison rPDHG vs. Gurobi, log-log scatter" width="750">
 </p>
+
+| DOTmark class | rPDHG [s] | Gurobi [s] | Ratio |
+|---|---:|---:|---:|
+| CauchyDensity | 21.73 | 5.31 | 4.09× |
+| ClassicImages | 17.64 | 5.67 | 3.11× |
+| GRFmoderate | 23.93 | 5.81 | 4.12× |
+| GRFrough | 20.73 | 3.70 | 5.61× |
+| GRFsmooth | 27.89 | 5.73 | 4.87× |
+| LogGRF | 30.85 | 5.46 | 5.65× |
+| LogitGRF | 26.16 | 5.75 | 4.55× |
+| MicroscopyImages | 21.60 | 5.29 | 4.09× |
+| Shapes | 25.08 | 3.28 | 7.64× |
+| WhiteNoise | 16.68 | 3.57 | 4.68× |
+
+Across all 400 instances, rPDHG is median $4.65\times$ (mean $5.15\times$)
+slower than Gurobi and only beats it on a single instance (0.25%) — Gurobi
+outperforms rPDHG on every tested class at this problem size. Given the
+[synchronization bottleneck](#host-device-synchronization-bottleneck) above,
+this gap is expected to narrow at larger problem sizes, where per-iteration
+sync costs amortize over more compute per kernel; $128\times128$ and larger
+runs are planned as follow-up work.
+
+### Solution Correctness
+
+A runtime advantage for Gurobi would be irrelevant if rPDHG converged to a
+worse solution. We compare the relative primal objective difference,
+$|f_{\text{rPDHG}} - f_{\text{Gurobi}}| / (1 + |f_{\text{Gurobi}}|)$, across
+all 400 instances:
+
+<p align="center">
+  <img src="diagrams/objective_agreement.png" alt="Relative objective agreement with Gurobi" width="750">
+</p>
+
+The median relative difference is $3.1\times10^{-9}$ (mean $7.4\times10^{-9}$);
+99 of 400 instances land just above rPDHG's own gap tolerance $10^{-8}$, with
+a worst case of $6.5\times10^{-8}$ — orders of magnitude below any
+practically relevant error. The runtime gap above is a speed difference, not
+an accuracy difference.
+
+### Performance Profile
+
+<p align="center">
+  <img src="diagrams/performance_profile.png" alt="Dolan-More performance profile" width="750">
+</p>
+
+A Dolan–Moré performance profile over all 400 instances: for a factor $\tau$,
+the curve gives the fraction of problems on which each solver is at most
+$\tau\times$ slower than the fastest solver on that instance. Gurobi is
+already near 100% at $\tau=1$; the rPDHG curve rises noticeably only around
+$\tau\approx3$–$4$ and reaches nearly all instances only around $\tau\approx10$,
+matching the $3$–$8\times$ range in the table above.
+
+### Restart Behavior
+
+<p align="center">
+  <img src="diagrams/restart_breakdown.png" alt="Restart breakdown per DOTmark class" width="1000">
+</p>
+
+Runs use a median of $\approx17$ restarts (median $6101$ iterations). On
+seven of ten classes, the phase *after* the last restart accounts for most of
+the total iterations — the solver spends most of its time in a final,
+restart-free polishing phase. On the remaining three (GRFsmooth, LogGRF,
+Shapes), the phase *between* restarts is longest instead, suggesting these
+classes keep triggering productive restarts almost until the tolerance is
+reached. This matches the pattern in the duality-gap plot above: dense early
+restarts during fast initial gap reduction, followed by a longer phase of
+finer convergence with fewer or no further restarts.
+
+## Hyperparameter Tuning
+
+We ran a systematic 3-phase hyperparameter search on a stratified 50-instance
+tuning set drawn from the 32×32 DOTmark benchmark (5 pairs per image category,
+seed 42; see `experiments/create_split_manifest.py`): Phase 1 compared
+preconditioning against the three restart strategies, Phase 2 tuned the
+winning restart strategy's own parameter, and Phase 3 swept the step-size and
+line-search parameters (`alpha`, `theta`, `step_shrinkage`,
+`rebalance_tau_sigma`). Each configuration's score is the Shifted Geometric
+Mean (SGM, shift = 10) of iterations-to-convergence across all 50 tuning
+instances. The chart below shows all 36 Phase 3 configurations:
+
+<p align="center">
+  <img src="diagrams/phase3_ranking_comparison.png" alt="Phase 3 hyperparameter ranking" width="1000">
+</p>
+
+The winning configuration (`alpha=1.0, theta=1.05, step_shrinkage=0.75,
+rebalance_tau_sigma=True`, on top of Phase 2's `restart_check=adaptive,
+min_epoch_length=100`) roughly halves the iteration count versus the
+untuned default (508 → 263 SGM iterations across the three phases). The
+Pock–Chambolle exponent `alpha=1.0` is the dominant factor — every one of
+the top 12 configurations uses it, while `alpha=0.5` and `alpha=1.5` both
+degrade convergence substantially; `step_shrinkage` and
+`rebalance_tau_sigma` barely move the ranking once `alpha` is set correctly.
