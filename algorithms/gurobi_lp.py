@@ -39,6 +39,7 @@ def solve_lp_gurobi(
     env.setParam("BarConvTol", params.tol_gap)
     env.setParam("Presolve", params.presolve)
     env.setParam("Threads", params.num_threads)
+    env.setParam("Crossover", params.crossover)
 
     if params.time_limit is not None:
         env.setParam("TimeLimit", float(params.time_limit))

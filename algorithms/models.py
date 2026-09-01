@@ -16,6 +16,8 @@ class SolverResult:
     iterations:Optional[int] = None
     restarts:Optional[int] = None
     restart_indices: Optional[List[int]] = None
+    tau_seq: Optional[List[float]] = None
+    sigma_seq: Optional[List[float]] = None
 
 
 @dataclass
@@ -56,12 +58,19 @@ class RPDHGParams:
 @dataclass
 class GurobiParams:
     method: int = -1           # -1=auto, 0=primal simplex, 1=dual, 2=barrier
-    tol_primal: float = 1e-9   # FeasibilityTol
-    tol_dual: float = 1e-9     # OptimalityTol
-    tol_gap: float = 1e-9
+    # Aligned to rPDHG's default target tolerance (1e-8, relative) so runtime
+    # comparisons stop both solvers at a comparable accuracy. Note the
+    # semantics still differ: these are Gurobi's absolute/relative-gap
+    # tolerances, rPDHG's are residuals normalized by 1+norm(b)/1+norm(c).
+    tol_primal: float = 1e-8   # FeasibilityTol
+    tol_dual: float = 1e-8     # OptimalityTol
+    tol_gap: float = 1e-8      # BarConvTol
     time_limit: Optional[float] = 600
     presolve: int = -1
     num_threads: int = 0       # 0 = all available cores
+    crossover: int = -1        # -1=auto (Gurobi default). Set 0 to skip crossover
+                                # for barrier-only runtime comparisons against rPDHG
+                                # (see gurobi_lp.py / evaluation.py for context).
 
 
 @dataclass

@@ -1,6 +1,25 @@
+import re
+
 import numpy as np
 import scipy.sparse as sp
 from algorithms.models import LPProblem
+
+# The 10 DOTmark categories (transportation_problems/dotmark/csv_data/<name>/).
+# Matched against the instance name to recover the category regardless of
+# naming convention (old: "LogGRFdata32_1003.csv_to_..."; new: "CauchyDensity_01_02").
+# Longest-first so "LogitGRF" isn't shadowed by a "LogGRF" prefix match.
+_DOTMARK_CATEGORIES = sorted([
+    "CauchyDensity", "ClassicImages", "GRFmoderate", "GRFrough", "GRFsmooth",
+    "LogGRF", "LogitGRF", "MicroscopyImages", "Shapes", "WhiteNoise",
+], key=len, reverse=True)
+_DOTMARK_CATEGORY_RE = re.compile("^(" + "|".join(_DOTMARK_CATEGORIES) + ")")
+
+
+def infer_dotmark_type(name: str) -> str:
+    """Recover the DOTmark category (e.g. 'LogGRF') from an instance name."""
+    m = _DOTMARK_CATEGORY_RE.match(name)
+    return m.group(1) if m else name.split("data")[0]
+
 
 def pixel_coordinates(H: int, W: int) -> np.ndarray:
 
@@ -91,5 +110,5 @@ def build_ot_lp(
         sum_b = float(B_vec.sum()),
         cost_type=cost_type,
         c_max = c_max,
-        dotmark_type= name.split("data")[0]
+        dotmark_type= infer_dotmark_type(name)
     )

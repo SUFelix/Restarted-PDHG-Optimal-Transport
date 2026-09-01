@@ -32,7 +32,6 @@ def pdhg_restarted_cu(
     params:RPDHGParams
 ) -> SolverResult:
 
-    global tau, sigma, k, mu_curr, x_restart, y_restart, mu_best
     A, b, c = problem.A, cp.asarray(problem.b) , cp.asarray(problem.c)
     m, n = A.shape
     N = m // 2
@@ -87,12 +86,24 @@ def pdhg_restarted_cu(
     gaps: list[float] = []
     primal_residual_seq: list[float] = []
     dual_residual_seq: list[float] = []
+    tau_seq: list[float] = []
+    sigma_seq: list[float] = []
     restart_indices: list[int] = []
     restart_count:int = 0
 
     mu_prev_restart = cp.inf
     mu_last_check = cp.inf
     iters_since_last_restart = 0
+
+    # Only ever assigned in the "adaptive" branch of the diagnostic block
+    # below (a restart candidate requires the mu-metric, which only that
+    # mode computes). Kept as explicit locals (rather than relying on
+    # first-use assignment) so it's obvious at a glance that "fixed"/"none"
+    # mode never touch them -- see the do_restart handling below.
+    x_restart = None
+    y_restart = None
+    mu_best = None
+    mu_curr = None
 
     for k in range(params.max_iter):
 
@@ -204,6 +215,8 @@ def pdhg_restarted_cu(
             gaps.append(abs_gap_curr)
             primal_residual_seq.append(primal_res_curr)
             dual_residual_seq.append(dual_res_curr)
+            tau_seq.append(tau)
+            sigma_seq.append(sigma)
 
             print(
                 f"Iter {k} | Primal: {p_obj_curr:.4e} | relPRes: {rel_primal_res:.2e} | relDRes: {rel_dual_res:.2e} | relGap: {rel_gap:.2e}|restartcheck: {params.restart_check} | tau: {tau}")
@@ -261,10 +274,17 @@ def pdhg_restarted_cu(
             restart_count += 1
             restart_indices.append(k)
 
-            x_curr = x_restart
-            y_curr = y_restart
-
+            # x_restart/y_restart are only computed in "adaptive" mode (the
+            # mu-metric comparison between z_curr and z_avg above). "fixed"
+            # mode has no such candidate -- a fixed-cadence restart only
+            # resets the epoch bookkeeping (averaging window, reference
+            # point for the mu-distance), not the iterate itself. Applying
+            # this unconditionally used to silently reuse x_restart/y_restart
+            # left over from a *different* problem's "adaptive" call earlier
+            # in the same process (via a `global` declaration removed here).
             if params.restart_check == "adaptive":
+                x_curr = x_restart
+                y_curr = y_restart
                 mu_prev_restart = mu_best
                 mu_last_check = mu_best
 
@@ -290,5 +310,7 @@ def pdhg_restarted_cu(
         restarts=restart_count,
         restart_indices=restart_indices,
         primal_res_seq= primal_residual_seq,
-        dual_res_seq=dual_residual_seq
+        dual_res_seq=dual_residual_seq,
+        tau_seq=tau_seq,
+        sigma_seq=sigma_seq
     )
